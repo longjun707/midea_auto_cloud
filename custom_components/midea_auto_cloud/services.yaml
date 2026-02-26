@@ -1,0 +1,18 @@
+# Services for Midea Auto Cloud integration
+
+refresh_device:
+  name: Refresh Device
+  description: Manually refresh device status immediately (without waiting for polling interval)
+  fields:
+    device_id:
+      name: Device ID
+      description: The device ID to refresh. Leave empty when using refresh_all.
+      example: "208907226912757"
+      selector:
+        text:
+    refresh_all:
+      name: Refresh All
+      description: Set to true to refresh all devices at once.
+      default: false
+      selector:
+        boolean:

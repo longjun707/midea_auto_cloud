@@ -1,0 +1,532 @@
+import asyncio
+import os
+import sys
+import base64
+import traceback
+import json
+import time
+import threading
+from importlib import import_module
+import re
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.util.json import load_json
+
+try:
+    from homeassistant.helpers.json import save_json as _ha_save_json
+except ImportError:
+    from homeassistant.util.json import save_json as _ha_save_json
+
+# 设备配置缓存，避免重复加载和并发写入
+_device_config_cache = {}
+_device_config_lock = threading.Lock()
+
+
+def save_json_safe(filename: str, data: dict, private: bool = False) -> None:
+    """
+    Windows 兼容的 JSON 保存函数。
+    先尝试使用 HA 原生 save_json，如果失败（Windows 权限问题）则回退为直接写入。
+    """
+    try:
+        _ha_save_json(filename, data, private)
+    except (PermissionError, OSError, Exception) as e:
+        # Windows 上重命名失败（包括 WriteError），回退为直接写入
+        # 确保目录存在
+        dir_path = os.path.dirname(filename)
+        if dir_path:
+            os.makedirs(dir_path, exist_ok=True)
+        # 先尝试删除旧文件，然后直接写入
+        for attempt in range(3):
+            try:
+                if os.path.exists(filename):
+                    os.remove(filename)
+                with open(filename, 'w', encoding='utf-8') as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+                return
+            except (PermissionError, OSError):
+                time.sleep(0.1 * (attempt + 1))  # 等待后重试
+        # 最后一次尝试
+        with open(filename, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+
+from homeassistant.helpers.typing import ConfigType
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.core import HomeAssistant
+from homeassistant.const import (
+    Platform,
+    CONF_TYPE,
+    CONF_PORT,
+    CONF_MODEL,
+    CONF_IP_ADDRESS,
+    CONF_DEVICE_ID,
+    CONF_PROTOCOL,
+    CONF_TOKEN,
+    CONF_NAME,
+    CONF_DEVICE,
+    CONF_ENTITIES,
+)
+
+from .core.logger import MideaLogger
+from .core.device import MiedaDevice
+from .data_coordinator import MideaDataUpdateCoordinator
+from .core.cloud import get_midea_cloud
+from .const import (
+    DOMAIN,
+    DEVICES,
+    CONF_REFRESH_INTERVAL,
+    CONFIG_PATH,
+    CONF_KEY,
+    CONF_ACCOUNT,
+    CONF_SN8,
+    CONF_SN,
+    CONF_MODEL_NUMBER,
+    CONF_SERVERS, STORAGE_PATH, CONF_MANUFACTURER_CODE,
+    CONF_SELECTED_HOMES, CONF_SMART_PRODUCT_ID, STORAGE_PLUGIN_PATH
+)
+# 账号型：登录云端、获取设备列表，并为每台设备建立协调器（无本地控制）
+from .const import CONF_PASSWORD as CONF_PASSWORD_KEY, CONF_SERVER as CONF_SERVER_KEY
+
+PLATFORMS: list[Platform] = [
+    Platform.BINARY_SENSOR,
+    Platform.SENSOR,
+    Platform.SWITCH,
+    Platform.CLIMATE,
+    Platform.SELECT,
+    Platform.WATER_HEATER,
+    Platform.FAN,
+    Platform.LIGHT,
+    Platform.HUMIDIFIER,
+    Platform.NUMBER,
+    Platform.BUTTON
+]
+
+async def import_module_async(module_name):
+    # 在线程池中执行导入操作
+    return await asyncio.to_thread(import_module, module_name, __package__)
+
+def get_sn8_used(hass: HomeAssistant, sn8):
+    entries = hass.config_entries.async_entries(DOMAIN)
+    count = 0
+    for entry in entries:
+        if sn8 == entry.data.get("sn8"):
+            count += 1
+    return count
+
+
+def remove_device_config(hass: HomeAssistant, sn8):
+    config_file = hass.config.path(f"{CONFIG_PATH}/{sn8}.json")
+    try:
+        os.remove(config_file)
+    except FileNotFoundError:
+        pass
+
+
+async def load_device_config(hass: HomeAssistant, device_type, sn8):
+    """加载设备配置，使用缓存避免并发写入冲突"""
+    global _device_config_cache
+    
+    # 缓存键
+    cache_key = f"{device_type}_{sn8}"
+    
+    # 检查缓存
+    with _device_config_lock:
+        if cache_key in _device_config_cache:
+            return _device_config_cache[cache_key]
+    
+    def _ensure_dir_and_load(path_dir: str, path_file: str):
+        os.makedirs(path_dir, exist_ok=True)
+        return load_json(path_file, default={})
+
+    config_dir = hass.config.path(CONFIG_PATH)
+    config_file = hass.config.path(f"{CONFIG_PATH}/{sn8}.json")
+    raw = await hass.async_add_executor_job(_ensure_dir_and_load, config_dir, config_file)
+    json_data = {}
+    
+    device_path = f".device_mapping.{'T0x%02X' % device_type}"
+    try:
+        mapping_module = await import_module_async(device_path)
+        for key, config in mapping_module.DEVICE_MAPPING.items():
+            # support tuple & regular expression pattern to support multiple sn8 sharing one mapping
+            if (key == sn8) or (isinstance(key, tuple) and sn8 in key) or (isinstance(key, str) and re.match(key, sn8)):
+                json_data = config
+                break
+        if not json_data:
+            if "default" in mapping_module.DEVICE_MAPPING:
+                json_data = mapping_module.DEVICE_MAPPING["default"]
+            else:
+                MideaLogger.warning(f"No mapping found for sn8 {sn8} in type {'T0x%02X' % device_type}")
+    except ModuleNotFoundError:
+        MideaLogger.warning(f"Can't load mapping file for type {'T0x%02X' % device_type}")
+
+    # 存入缓存
+    with _device_config_lock:
+        _device_config_cache[cache_key] = json_data
+    
+    # 异步保存到文件（使用锁避免并发写入）
+    save_data = {sn8: json_data}
+    try:
+        await hass.async_add_executor_job(save_json_safe, config_file, save_data)
+    except Exception as e:
+        MideaLogger.warning(f"Failed to save device config for {sn8}: {e}")
+    
+    return json_data
+
+async def update_listener(hass: HomeAssistant, config_entry: ConfigEntry):
+    device_id = config_entry.data.get(CONF_DEVICE_ID)
+    if device_id is not None:
+        ip_address = config_entry.options.get(
+            CONF_IP_ADDRESS, None
+        )
+        refresh_interval = config_entry.options.get(
+            CONF_REFRESH_INTERVAL, None
+        )
+        device: MiedaDevice = hass.data[DOMAIN][DEVICES][device_id][CONF_DEVICE]
+        if device:
+            if ip_address is not None:
+                device.set_ip_address(ip_address)
+            if refresh_interval is not None:
+                device.set_refresh_interval(refresh_interval)
+
+
+async def async_setup(hass: HomeAssistant, config: ConfigType):
+    hass.data.setdefault(DOMAIN, {})
+    os.makedirs(hass.config.path(STORAGE_PATH), exist_ok=True)
+    lua_path = hass.config.path(STORAGE_PATH)
+    
+    # 注册手动刷新服务
+    async def handle_refresh_device(call):
+        """Handle the refresh_device service call."""
+        device_id = call.data.get("device_id")
+        refresh_all = call.data.get("refresh_all", False)
+        
+        accounts = hass.data.get(DOMAIN, {}).get("accounts", {})
+        refreshed_count = 0
+        
+        for account_data in accounts.values():
+            coordinator_map = account_data.get("coordinator_map", {})
+            
+            if refresh_all:
+                # 刷新所有设备
+                for coord in coordinator_map.values():
+                    await coord.async_request_refresh()
+                    refreshed_count += 1
+            elif device_id:
+                # 刷新指定设备
+                device_id_int = int(device_id)
+                if device_id_int in coordinator_map:
+                    await coordinator_map[device_id_int].async_request_refresh()
+                    refreshed_count += 1
+        
+        MideaLogger.info(f"Manual refresh triggered for {refreshed_count} device(s)")
+    
+    hass.services.async_register(
+        DOMAIN,
+        "refresh_device",
+        handle_refresh_device,
+    )
+
+    cjson = os.path.join(lua_path, "cjson.lua")
+    bit = os.path.join(lua_path, "bit.lua")
+
+    # 只有文件不存在时才创建
+    if not os.path.exists(cjson):
+        from .const import CJSON_LUA
+        cjson_lua = base64.b64decode(CJSON_LUA.encode("utf-8")).decode("utf-8")
+        try:
+            with open(cjson, "wt") as fp:
+                fp.write(cjson_lua)
+        except PermissionError as e:
+            MideaLogger.error(f"Failed to create cjson.lua at {cjson}: {e}")
+            # 如果无法创建文件，尝试使用临时目录
+            import tempfile
+            temp_dir = tempfile.gettempdir()
+            cjson = os.path.join(temp_dir, "cjson.lua")
+            with open(cjson, "wt") as fp:
+                fp.write(cjson_lua)
+            MideaLogger.warning(f"Using temporary file for cjson.lua: {cjson}")
+
+    if not os.path.exists(bit):
+        from .const import BIT_LUA
+        bit_lua = base64.b64decode(BIT_LUA.encode("utf-8")).decode("utf-8")
+        try:
+            with open(bit, "wt") as fp:
+                fp.write(bit_lua)
+        except PermissionError as e:
+            MideaLogger.error(f"Failed to create bit.lua at {bit}: {e}")
+            # 如果无法创建文件，尝试使用临时目录
+            import tempfile
+            temp_dir = tempfile.gettempdir()
+            bit = os.path.join(temp_dir, "bit.lua")
+            with open(bit, "wt") as fp:
+                fp.write(bit_lua)
+            MideaLogger.warning(f"Using temporary file for bit.lua: {bit}")
+
+    return True
+
+async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry):
+    device_type = config_entry.data.get(CONF_TYPE)
+    MideaLogger.debug(f"async_setup_entry type={device_type} data={config_entry.data}")
+    if device_type == CONF_ACCOUNT:
+        account = config_entry.data.get(CONF_ACCOUNT)
+        password = config_entry.data.get(CONF_PASSWORD_KEY)
+        server = config_entry.data.get(CONF_SERVER_KEY)
+        cloud_name = CONF_SERVERS.get(server)
+        cloud = get_midea_cloud(
+            cloud_name=cloud_name,
+            session=async_get_clientsession(hass),
+            account=account,
+            password=password,
+        )
+        if not cloud or not await cloud.login():
+            MideaLogger.error("Midea cloud login failed")
+            return False
+
+        # 拉取家庭与设备列表
+        try:
+            homes = await cloud.list_home()
+            if homes and len(homes) > 0:
+                hass.data.setdefault(DOMAIN, {})
+                hass.data[DOMAIN].setdefault("accounts", {})
+                bucket = {"device_list": {}, "coordinator_map": {}}
+                
+                # 获取用户选择的家庭ID列表
+                selected_homes = config_entry.data.get(CONF_SELECTED_HOMES, [])
+                MideaLogger.debug(f"Selected homes from config: {selected_homes}")
+                MideaLogger.debug(f"Available homes keys: {list(homes.keys())}")
+                if not selected_homes:
+                    # 如果没有选择，默认使用所有家庭
+                    home_ids = list(homes.keys())
+                else:
+                    # 只处理用户选择的家庭，确保类型匹配
+                    home_ids = []
+                    for selected_home in selected_homes:
+                        # 尝试匹配字符串和数字类型的home_id
+                        if selected_home in homes:
+                            home_ids.append(selected_home)
+                        elif str(selected_home) in homes:
+                            home_ids.append(str(selected_home))
+                        else:
+                            try:
+                                int_home = int(selected_home)
+                                if int_home in homes:
+                                    home_ids.append(int_home)
+                            except (ValueError, TypeError):
+                                MideaLogger.warning(f"Cannot match home_id: {selected_home}")
+                MideaLogger.debug(f"Final home_ids to process: {home_ids}")
+
+                for home_id in home_ids:
+                    appliances = await cloud.list_appliances(home_id)
+                    if appliances is None:
+                        continue
+
+                    # 为每台设备构建占位设备与协调器（不连接本地）
+                    for appliance_code, info in appliances.items():
+                        MideaLogger.debug(f"info={info} ")
+
+                        os.makedirs(hass.config.path(STORAGE_PATH), exist_ok=True)
+                        path = hass.config.path(STORAGE_PATH)
+                        file = await cloud.download_lua(
+                            path=path,
+                            device_type=info.get(CONF_TYPE),
+                            sn=info.get(CONF_SN),
+                            model_number=info.get(CONF_MODEL_NUMBER),
+                            manufacturer_code=info.get(CONF_MANUFACTURER_CODE),
+                        )
+                        try:
+                            os.makedirs(hass.config.path(STORAGE_PLUGIN_PATH), exist_ok=True)
+                            plugin_path = hass.config.path(STORAGE_PLUGIN_PATH)
+                            await cloud.download_plugin(
+                                path=plugin_path,
+                                appliance_code=appliance_code,
+                                smart_product_id=info.get(CONF_SMART_PRODUCT_ID),
+                                device_type=info.get(CONF_TYPE),
+                                sn=info.get(CONF_SN),
+                                sn8=info.get(CONF_SN8),
+                                model_number=info.get(CONF_MODEL_NUMBER),
+                                manufacturer_code=info.get(CONF_MANUFACTURER_CODE),
+                            )
+                        except Exception as e:
+                            MideaLogger.debug(f"Failed to download plugin for {appliance_code}: {e}, {traceback.format_exc()}")
+
+                        try:
+                            device = MiedaDevice(
+                                name=info.get(CONF_NAME),
+                                device_id=appliance_code,
+                                device_type=info.get(CONF_TYPE),
+                                ip_address=None,
+                                port=None,
+                                token=None,
+                                key=None,
+                                connected=info.get("online"),
+                                protocol=info.get(CONF_PROTOCOL) or 2,
+                                model=info.get(CONF_MODEL),
+                                subtype=info.get(CONF_MODEL_NUMBER),
+                                manufacturer_code=info.get(CONF_MANUFACTURER_CODE),
+                                sn=info.get(CONF_SN),
+                                sn8=info.get(CONF_SN8),
+                                lua_file=file,
+                                cloud=cloud,
+                            )
+                            # 加载并应用设备映射（queries/centralized/calculate），并预置 attributes 键
+                            try:
+                                mapping = await load_device_config(
+                                    hass,
+                                    info.get(CONF_TYPE) or info.get("type"),
+                                    info.get(CONF_SN8) or info.get("sn8"),
+                                ) or {}
+                            except Exception as e:
+                                MideaLogger.debug(f"Failed to load device config: {e}")
+                                mapping = {}
+
+                            try:
+                                device.set_queries(mapping.get("queries", [{}]))
+                            except Exception as e:
+                                MideaLogger.debug(f"Failed to set queries: {e}")
+                            try:
+                                device.set_centralized(mapping.get("centralized", []))
+                            except Exception as e:
+                                MideaLogger.debug(f"Failed to set centralized: {e}")
+                            try:
+                                device.set_calculate(mapping.get("calculate", {}))
+                            except Exception as e:
+                                MideaLogger.debug(f"Failed to set calculate: {e}")
+
+                            # 预置 attributes：包含 centralized 里声明的所有键、entities 中使用到的所有属性键
+                            try:
+                                preset_keys = set(mapping.get("centralized", []))
+                                entities_cfg = (mapping.get("entities") or {})
+                                # 收集实体配置中直接引用的属性键
+                                for platform_cfg in entities_cfg.values():
+                                    if not isinstance(platform_cfg, dict):
+                                        continue
+                                    for _, ecfg in platform_cfg.items():
+                                        if not isinstance(ecfg, dict):
+                                            continue
+                                        # 常见直接属性字段
+                                        for k in [
+                                            "power",
+                                            "aux_heat",
+                                            "current_temperature",
+                                            "target_temperature",
+                                            "oscillate",
+                                            "min_temp",
+                                            "max_temp",
+                                        ]:
+                                            v = ecfg.get(k)
+                                            if isinstance(v, str):
+                                                preset_keys.add(v)
+                                            elif isinstance(v, list):
+                                                for vv in v:
+                                                    if isinstance(vv, str):
+                                                        preset_keys.add(vv)
+                                        # 模式映射里的条件字段
+                                        for map_key in [
+                                            "hvac_modes",
+                                            "preset_modes",
+                                            "swing_modes",
+                                            "fan_modes",
+                                            "operation_list",
+                                            "options",
+                                        ]:
+                                            maps = ecfg.get(map_key) or {}
+                                            if isinstance(maps, dict):
+                                                for _, cond in maps.items():
+                                                    if isinstance(cond, dict):
+                                                        for attr_name in cond.keys():
+                                                            preset_keys.add(attr_name)
+                                # 传感器/开关等实体 key 本身也加入（其 key 即属性名）
+                                for platform_name, platform_cfg in entities_cfg.items():
+                                    if not isinstance(platform_cfg, dict):
+                                        continue
+                                    platform_str = str(platform_name)
+                                    if platform_str in [
+                                        str(Platform.SENSOR),
+                                        str(Platform.BINARY_SENSOR),
+                                        str(Platform.SWITCH),
+                                        str(Platform.FAN),
+                                        str(Platform.SELECT),
+                                    ]:
+                                        for entity_key in platform_cfg.keys():
+                                            preset_keys.add(entity_key)
+                                # 写入默认空值
+                                for k in preset_keys:
+                                    if k not in device.attributes:
+                                        device.attributes[k] = None
+                                # 针对T0xD9复式洗衣机，设置默认的筒选择为左筒
+                                if device.device_type == 0xD9:
+                                    device.attributes["db_location_selection"] = "left"
+                            except Exception as e:
+                                MideaLogger.debug(f"Failed to preset attributes: {e}")
+
+                            coordinator = MideaDataUpdateCoordinator(hass, config_entry, device, cloud=cloud)
+                            # 后台刷新，避免初始化阻塞
+                            hass.async_create_task(coordinator.async_config_entry_first_refresh())
+                            bucket["device_list"][appliance_code] = info
+                            bucket["coordinator_map"][appliance_code] = coordinator
+                        except Exception as e:
+                            MideaLogger.error(f"Init device failed: {appliance_code}, error: {e}")
+                    # break
+                hass.data[DOMAIN]["accounts"][config_entry.entry_id] = bucket
+
+                # 启动 SSE 实时状态监听
+                try:
+                    MideaLogger.debug("SSE: Attempting to start real-time listener...")
+                    if hasattr(cloud, 'start_sse_listener'):
+                        sse_started = await cloud.start_sse_listener()
+                        if sse_started:
+                            MideaLogger.info("SSE: Real-time status listener started successfully")
+                            # 为每个设备注册 SSE 回调
+                            for appliance_code, coordinator in bucket["coordinator_map"].items():
+                                cloud.register_sse_callback(
+                                    str(appliance_code),
+                                    coordinator._sse_update_callback
+                                )
+                                MideaLogger.debug(f"SSE: Registered callback for device {appliance_code}")
+                        else:
+                            MideaLogger.debug("SSE: Failed to start listener, falling back to polling")
+                    else:
+                        MideaLogger.debug("SSE: Cloud does not have start_sse_listener method")
+                except Exception as e:
+                    import traceback
+                    MideaLogger.debug(f"SSE: Error starting listener: {e}")
+                    MideaLogger.debug(f"SSE: Traceback: {traceback.format_exc()}")
+
+        except Exception as e:
+            MideaLogger.error(f"Fetch appliances failed: {e}")
+        await hass.config_entries.async_forward_entry_setups(config_entry, PLATFORMS)
+        return True
+
+
+async def async_unload_entry(hass: HomeAssistant, config_entry: ConfigEntry):
+    device_id = config_entry.data.get(CONF_DEVICE_ID)
+    device_type = config_entry.data.get(CONF_TYPE)
+    if device_type == CONF_ACCOUNT:
+        # 停止 SSE 监听
+        try:
+            bucket = hass.data.get(DOMAIN, {}).get("accounts", {}).get(config_entry.entry_id, {})
+            # 尝试从第一个 coordinator 获取 cloud 对象
+            for coordinator in bucket.get("coordinator_map", {}).values():
+                if hasattr(coordinator, '_cloud') and coordinator._cloud:
+                    cloud = coordinator._cloud
+                    if hasattr(cloud, 'stop_sse_listener'):
+                        await cloud.stop_sse_listener()
+                        MideaLogger.info("SSE: Listener stopped")
+                    break
+        except Exception as e:
+            MideaLogger.debug(f"SSE: Error stopping listener: {e}")
+
+        # 卸载平台并清理账号桶
+        unload_ok = await hass.config_entries.async_unload_platforms(config_entry, PLATFORMS)
+        if unload_ok:
+            try:
+                hass.data.get(DOMAIN, {}).get("accounts", {}).pop(config_entry.entry_id, None)
+            except Exception as e:
+                MideaLogger.debug(f"Failed to cleanup account data: {e}")
+        return unload_ok
+    if device_id is not None:
+        device: MiedaDevice = hass.data[DOMAIN][DEVICES][device_id][CONF_DEVICE]
+        if device is not None:
+            if get_sn8_used(hass, device.sn8) == 1:
+                remove_device_config(hass, device.sn8)
+            # device.close()
+        hass.data[DOMAIN][DEVICES].pop(device_id)
+    return await hass.config_entries.async_unload_platforms(config_entry, PLATFORMS)
