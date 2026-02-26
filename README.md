@@ -17,7 +17,7 @@
 
 1. 打开 HACS
 2. 点击右上角菜单 → 自定义仓库
-3. 添加仓库地址：`https://github.com/YOUR_USERNAME/midea_auto_cloud`
+3. 添加仓库地址：`https://github.com/longjun707/midea_auto_cloud`
 4. 类别选择 `Integration`
 5. 搜索 `Midea Auto Cloud` 并安装
 6. 重启 Home Assistant
